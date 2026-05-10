@@ -1,6 +1,6 @@
 # zwren
 
-A Zig wrapper around the [Wren](https://wren.io) scripting language.
+Comptime string based Zig wrapper around the [Wren](https://wren.io) scripting language.
 
 ## Requirements
 

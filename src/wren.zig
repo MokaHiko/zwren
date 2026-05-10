@@ -29,6 +29,7 @@ const Error = error{
     InvalidType,
 
     ImportsUnsupported,
+    OutOfMemory,
 };
 
 /// Configuration passed to `VirtualMachine.init`.
@@ -92,10 +93,9 @@ pub const Class = struct {
     /// `WrenHandle` to Class.
     handle: *c.WrenHandle,
 
-    pub fn init(comptime module: [*c]const u8, wren: VirtualMachine, name: [:0]const u8) !Class {
+    pub fn init(wren: VirtualMachine, comptime module: [*c]const u8, name: [:0]const u8) !Class {
         // Find class via name
         c.wrenEnsureSlots(wren.vm, 1);
-
         c.wrenGetVariable(wren.vm, module, name, 0);
 
         if (c.wrenGetSlotHandle(wren.vm, 0)) |handle| {
@@ -147,7 +147,10 @@ fn bindForeignClassFn(c_vm: ?*c.WrenVM, module: [*c]const u8, className: [*c]con
     }) catch return .{};
 
     if (vm_context.foreign_methods.get(key)) |method| {
-        return .{ .allocate = method };
+        return .{
+            .allocate = method,
+            .finalize = vm_context.finalize_methods.get(key) orelse null,
+        };
     } else {
         std.log.err("No class defined with `{s}` found in the ff:", .{key});
         var iterator = vm_context.foreign_methods.iterator();
@@ -221,6 +224,12 @@ const VMContext = struct {
     /// Lookup table for foreign class allocators and method fns, keyed by "module.Class[.sig]".
     foreign_methods: std.StringHashMap(c.WrenForeignMethodFn),
 
+    /// Lookup table for foreign class finalizers "module.Class[.sig]".
+    finalize_methods: std.StringHashMap(c.WrenFinalizerFn),
+
+    /// Lookup table for class context, keyed by "module.Class".
+    class_context: std.StringHashMap(*anyopaque),
+
     /// User-supplied module loader; called once per unresolved import.
     load_module_fn: ?*const fn (c_vm: ?*c.WrenVM, module_name: []const u8) ?[]const u8,
 
@@ -254,8 +263,10 @@ pub fn init(gpa: Allocator, conf: Configuration) !VirtualMachine {
     const vm_context = try gpa.create(VMContext);
     vm_context.* = .{
         .foreign_methods = .init(gpa),
+        .finalize_methods = .init(gpa),
         .user_data = conf.userData,
         .load_module_fn = conf.load_module_fn,
+        .class_context = .init(gpa),
         .load_module_complete_fn = conf.load_module_complete_fn,
         .err = null,
     };
@@ -276,9 +287,17 @@ pub fn deinit(self: *VirtualMachine, gpa: Allocator) void {
     if (c.wrenGetUserData(self.vm)) |ptr| {
         const vm_context: *VMContext = @ptrCast(@alignCast(ptr));
         vm_context.foreign_methods.deinit();
+        vm_context.finalize_methods.deinit();
+        vm_context.class_context.deinit();
         gpa.destroy(vm_context);
     }
     c.wrenFreeVM(self.vm);
+}
+
+pub fn lastError(self: *VirtualMachine) ?c.WrenErrorType {
+    const ptr = c.wrenGetUserData(self.vm) orelse return null;
+    const vm_context: *VMContext = @ptrCast(@alignCast(ptr));
+    return vm_context.err;
 }
 
 /// Wraps a raw C `WrenVM*` without taking ownership. Useful inside foreign method callbacks.
@@ -298,6 +317,16 @@ pub fn setUserData(self: *VirtualMachine, data: *anyopaque) void {
     const ptr = c.wrenGetUserData(self.vm) orelse return;
     const vm_context: *VMContext = @ptrCast(@alignCast(ptr));
     vm_context.user_data = data;
+}
+
+pub fn slotCount(self: *VirtualMachine) i32 {
+    return c.wrenGetSlotCount(self.vm);
+}
+
+pub fn classContext(self: *VirtualMachine, comptime module: []const u8, comptime class: []const u8) ?*anyopaque {
+    const ptr = c.wrenGetUserData(self.vm) orelse return null;
+    const vm_context: *VMContext = @ptrCast(@alignCast(ptr));
+    return vm_context.class_context.get(module ++ "." ++ class);
 }
 
 /// Registers foreign methods for a class in a module.
@@ -322,7 +351,7 @@ pub fn bindForeignMethods(
 
         /// Foreign fn.
         method: c.WrenForeignMethodFn = null,
-        finalzer: c.WrenFinalizerFn = null,
+        finalizer: c.WrenFinalizerFn = null,
 
         /// Flags
         flags: struct {
@@ -330,15 +359,28 @@ pub fn bindForeignMethods(
             finalize: bool = false,
         },
     },
+    context: struct { user_ptr: ?*anyopaque = null },
 ) !void {
     const ptr = c.wrenGetUserData(self.vm) orelse return Error.VirutalMachineIsUninitialized;
     const vm_context: *VMContext = @ptrCast(@alignCast(ptr));
 
+    // Set foreign context
+    if (context.user_ptr) |user_ptr| {
+        const key = module ++ "." ++ class;
+        try vm_context.class_context.put(key, user_ptr);
+    }
+
+    // Set foreign methods
     inline for (methods) |m| {
-        // Constructor
-        if (m.sig.len == 0) {
+        if (m.flags.allocate) {
             const key = module ++ "." ++ class;
             try vm_context.foreign_methods.put(key, m.method);
+            continue;
+        }
+
+        if (m.flags.finalize) {
+            const key = module ++ "." ++ class;
+            try vm_context.finalize_methods.put(key, m.finalizer);
             continue;
         }
 
@@ -347,12 +389,14 @@ pub fn bindForeignMethods(
     }
 }
 
-/// Reads slot `slot` as type `T`. Supported types: f64/f32, i32/u32, `[]const u8`.
+// TODO: RETURN NULL ONLY
+/// Reads slot `slot` as type `T`. Supported types: f64/f32, i32/u32, `[]const u8` and `Handle`.
 pub fn getSlot(self: *VirtualMachine, comptime T: type, slot: i32) !T {
     return @as(T, switch (T) {
         f64, f32, comptime_float => @floatCast(c.wrenGetSlotDouble(self.vm, slot)),
         i32, comptime_int => @intFromFloat(c.wrenGetSlotDouble(self.vm, slot)),
         u32 => @intFromFloat(c.wrenGetSlotDouble(self.vm, slot)),
+        Handle => c.wrenGetSlotHandle(self.vm, slot),
         []const u8 => std.mem.span(c.wrenGetSlotString(self.vm, slot)),
         else => return Error.InvalidType,
     });
@@ -383,14 +427,18 @@ pub fn setSlot(self: *VirtualMachine, val: anytype, slot: i32) !void {
     }
 }
 
-/// Allocates a new Wren foreign object of `T`'s size in slot 0 and writes `val` into it.
+/// Allocates a returns new Wren foreign object of `T`'s size in slot 0 and writes `val` into it.
 /// Must be called from within a foreign class allocator.
-pub fn newForeign(self: *VirtualMachine, val: anytype) !void {
+pub fn newForeign(self: *VirtualMachine, val: anytype) !*@TypeOf(val) {
     const T = @TypeOf(val);
     if (c.wrenSetSlotNewForeign(self.vm, 0, 0, @sizeOf(T))) |data| {
         const instance: *T = @ptrCast(@alignCast(data));
         instance.* = val;
+
+        return instance;
     }
+
+    return Error.OutOfMemory;
 }
 
 /// Compiles and runs `src_code` inside `module`.
