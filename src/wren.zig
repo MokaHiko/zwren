@@ -323,7 +323,7 @@ pub fn slotCount(self: *VirtualMachine) i32 {
     return c.wrenGetSlotCount(self.vm);
 }
 
-pub fn classContext(self: *VirtualMachine, comptime module: []const u8, comptime class: []const u8) ?*anyopaque {
+pub fn classContext(self: VirtualMachine, comptime module: []const u8, comptime class: []const u8) ?*anyopaque {
     const ptr = c.wrenGetUserData(self.vm) orelse return null;
     const vm_context: *VMContext = @ptrCast(@alignCast(ptr));
     return vm_context.class_context.get(module ++ "." ++ class);
@@ -353,6 +353,8 @@ pub fn bindForeignMethods(
         method: c.WrenForeignMethodFn = null,
         finalizer: c.WrenFinalizerFn = null,
 
+        method_wError: ?*const fn (VirtualMachine, ?*anyopaque) anyerror!void = null,
+
         /// Flags
         flags: struct {
             allocate: bool = false,
@@ -373,11 +375,28 @@ pub fn bindForeignMethods(
     // Set foreign methods
     inline for (methods) |m| {
         if (m.flags.allocate) {
+            if (m.method_wError) |merror| {
+                const MethodDispatcher = struct {
+                    fn call(c_vm: ?*RawVM) callconv(.c) void {
+                        const vm: VirtualMachine = .fromRaw(c_vm.?);
+                        merror(vm, vm.classContext(module, class)) catch |e| std.log.err("Wren Foreign Method Error: {}", .{e});
+                    }
+                };
+
+                const key = module ++ "." ++ class;
+                try vm_context.foreign_methods.put(key, MethodDispatcher.call);
+                continue;
+            }
+        }
+
+        // TODO: Remove
+        if (m.flags.allocate) {
             const key = module ++ "." ++ class;
             try vm_context.foreign_methods.put(key, m.method);
             continue;
         }
 
+        // TODO: Remove
         if (m.flags.finalize) {
             const key = module ++ "." ++ class;
             try vm_context.finalize_methods.put(key, m.finalizer);
@@ -386,24 +405,71 @@ pub fn bindForeignMethods(
 
         const key = module ++ "." ++ class ++ "." ++ m.sig;
         try vm_context.foreign_methods.put(key, m.method);
+
+        if (m.method_wError) |merror| {
+            const MethodDispatcher = struct {
+                fn call(c_vm: ?*RawVM) callconv(.c) void {
+                    const vm: VirtualMachine = .fromRaw(c_vm.?);
+                    merror(vm, vm.classContext(module, class)) catch |e| std.log.err("Wren Foreign Method Error: {}", .{e});
+                }
+            };
+
+            try vm_context.foreign_methods.put(key, MethodDispatcher.call);
+        }
     }
 }
 
-// TODO: RETURN NULL ONLY
 /// Reads slot `slot` as type `T`. Supported types: f64/f32, i32/u32, `[]const u8` and `Handle`.
-pub fn getSlot(self: *VirtualMachine, comptime T: type, slot: i32) !T {
+pub fn getSlot(self: VirtualMachine, comptime T: type, slot: i32) !T {
     return @as(T, switch (T) {
         f64, f32, comptime_float => @floatCast(c.wrenGetSlotDouble(self.vm, slot)),
         i32, comptime_int => @intFromFloat(c.wrenGetSlotDouble(self.vm, slot)),
-        u32 => @intFromFloat(c.wrenGetSlotDouble(self.vm, slot)),
-        Handle => c.wrenGetSlotHandle(self.vm, slot),
+        usize, u32, u64 => @intFromFloat(c.wrenGetSlotDouble(self.vm, slot)),
+        [*]u8, [*]const u8 => @ptrFromInt(@as(u64, @bitCast(c.wrenGetSlotDouble(self.vm, slot)))),
         []const u8 => std.mem.span(c.wrenGetSlotString(self.vm, slot)),
+        Handle => c.wrenGetSlotHandle(self.vm, slot),
         else => return Error.InvalidType,
     });
 }
 
+pub const ListIterator = struct {
+    index: i32,
+    count: i32,
+    list_slot: i32,
+    wren: VirtualMachine,
+
+    pub fn init(wren: VirtualMachine, list_slot: i32) ListIterator {
+        return .{
+            .wren = wren,
+            .list_slot = list_slot,
+            .index = 0,
+            .count = c.wrenGetListCount(wren.vm, list_slot),
+        };
+    }
+
+    pub fn next(self: *ListIterator, comptime T: type) ?T {
+        if (self.index >= self.count) return null;
+
+        defer self.index += 1;
+
+        c.wrenEnsureSlots(self.wren.vm, 1);
+        c.wrenGetListElement(self.wren.vm, self.list_slot, self.index, 0);
+
+        return self.wren.getSlot(T, 0) catch @panic("Invalid slot or type!");
+    }
+};
+
+pub fn iterateList(self: VirtualMachine, list_slot: i32) ListIterator {
+    return .init(self, list_slot);
+}
+
+pub fn getListElement(self: VirtualMachine, comptime T: type, list_slot: i32, index: i32) !T {
+    c.wrenGetListElement(self.vm, list_slot, index, 0);
+    return self.getSlot(T, 0);
+}
+
 /// Returns a typed pointer to the foreign object data stored in `slot`
-pub fn getSlotForeign(self: *VirtualMachine, comptime T: type, slot: i32) !*T {
+pub fn getSlotForeign(self: VirtualMachine, comptime T: type, slot: i32) !*T {
     if (c.wrenGetSlotForeign(self.vm, slot)) |data| {
         const instance: *T = @ptrCast(@alignCast(data));
         return instance;
@@ -412,24 +478,30 @@ pub fn getSlotForeign(self: *VirtualMachine, comptime T: type, slot: i32) !*T {
     return Error.VariableDoesNotExist;
 }
 
+/// TODO: Change to no throw error
 /// Writes a value into `slot`. Supported types: f64/f32, i32/u32
-pub fn setSlot(self: *VirtualMachine, val: anytype, slot: i32) !void {
-    const T = @TypeOf(val);
+pub fn setSlot(self: VirtualMachine, val: anytype, slot: i32) !void {
+    // const T = @TypeOf(val);
     switch (@TypeOf(val)) {
         bool => c.wrenSetSlotBool(self.vm, slot, val),
         f64, f32, comptime_float => c.wrenSetSlotDouble(self.vm, slot, @floatCast(val)),
         u32, i32, comptime_int => c.wrenSetSlotDouble(self.vm, slot, @floatFromInt(val)),
-        else => switch (@typeInfo(T)) {
-            // Catches [:0]const u8, []const u8, [*:0]const u8, and *const [N:0]u8
-            .pointer => c.wrenSetSlotString(self.vm, slot, @ptrCast(val)),
-            else => return Error.InvalidType,
-        },
+        u64, usize => c.wrenSetSlotDouble(self.vm, slot, @floatFromInt(val)),
+        [*]u8, [*]const u8 => c.wrenSetSlotDouble(self.vm, slot, @bitCast(val)),
+        [:0]u8, [:0]const u8 => c.wrenSetSlotString(self.vm, slot, @ptrCast(val)),
+        []u8, []const u8 => c.wrenSetSlotBytes(self.vm, slot, val.ptr, val.len),
+        else => @panic("Set slot invalid type"),
     }
+}
+
+/// Writes a null value into `slot`.
+pub fn setSlotNull(self: VirtualMachine, slot: i32) void {
+    c.wrenSetSlotNull(self.vm, slot);
 }
 
 /// Allocates a returns new Wren foreign object of `T`'s size in slot 0 and writes `val` into it.
 /// Must be called from within a foreign class allocator.
-pub fn newForeign(self: *VirtualMachine, val: anytype) !*@TypeOf(val) {
+pub fn newForeign(self: VirtualMachine, val: anytype) !*@TypeOf(val) {
     const T = @TypeOf(val);
     if (c.wrenSetSlotNewForeign(self.vm, 0, 0, @sizeOf(T))) |data| {
         const instance: *T = @ptrCast(@alignCast(data));
@@ -442,7 +514,7 @@ pub fn newForeign(self: *VirtualMachine, val: anytype) !*@TypeOf(val) {
 }
 
 /// Compiles and runs `src_code` inside `module`.
-pub fn interpret(self: *VirtualMachine, comptime module: anytype, src_code: [:0]const u8) !void {
+pub fn interpret(self: VirtualMachine, comptime module: anytype, src_code: [:0]const u8) !void {
     const result = c.wrenInterpret(self.vm, module, src_code);
 
     switch (result) {
@@ -455,7 +527,7 @@ pub fn interpret(self: *VirtualMachine, comptime module: anytype, src_code: [:0]
 
 /// Calls a static method on `class` with the given `args` tuple.
 /// `args` length must equal `method.argc`.
-pub fn callStatic(self: *VirtualMachine, class: Class, method: Method, args: anytype) !void {
+pub fn callStatic(self: VirtualMachine, class: Class, method: Method, args: anytype) !void {
     const Args = @TypeOf(args);
     const args_struct = @typeInfo(Args).@"struct";
     const fields = args_struct.fields;
@@ -489,7 +561,7 @@ pub fn callStatic(self: *VirtualMachine, class: Class, method: Method, args: any
 
 /// Calls `constructor` on `class` and returns a pinned handle to the new instance.
 /// Caller is responsible for releasing the handle with `wrenReleaseHandle`.
-pub fn new(self: *VirtualMachine, class: Class, constructor: Method, args: anytype) !Handle {
+pub fn new(self: VirtualMachine, class: Class, constructor: Method, args: anytype) !Handle {
     const Args = @TypeOf(args);
     const args_struct = @typeInfo(Args).@"struct";
     const fields = args_struct.fields;
@@ -522,7 +594,7 @@ pub fn new(self: *VirtualMachine, class: Class, constructor: Method, args: anyty
 }
 
 /// Calls `method` on an existing `object` handle with the given `args` tuple.
-pub fn call(self: *VirtualMachine, object: Handle, method: Method, args: anytype) !void {
+pub fn call(self: VirtualMachine, object: Handle, method: Method, args: anytype) !void {
     const Args = @TypeOf(args);
     const args_struct = @typeInfo(Args).@"struct";
     const fields = args_struct.fields;
